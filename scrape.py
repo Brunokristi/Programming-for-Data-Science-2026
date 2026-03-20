@@ -9,7 +9,6 @@ from bs4 import BeautifulSoup
 
 BASE_URL = "http://books.toscrape.com/"
 CATALOGUE_URL = urljoin(BASE_URL, "catalogue/")
-START_URL = urljoin(CATALOGUE_URL, "page-1.html")
 
 HEADERS = {
     "User-Agent": (
@@ -41,6 +40,23 @@ def rating_to_number(rating_class: str) -> int:
     return mapping.get(rating_class, 0)
 
 
+def extract_price_number(price_text: str) -> float:
+    """
+    Converts strings like 'Â£17.46' or '£17.46' into 17.46
+    """
+    match = re.search(r"(\d+\.\d+)", price_text)
+    return float(match.group(1)) if match else 0.0
+
+
+def extract_availability_number(availability_text: str) -> int:
+    """
+    Converts 'In stock (19 available)' into 19
+    If no number is found, returns 0
+    """
+    match = re.search(r"(\d+)", availability_text)
+    return int(match.group(1)) if match else 0
+
+
 def parse_book_list_page(url: str) -> list[dict]:
     soup = get_soup(url)
     books = []
@@ -49,30 +65,13 @@ def parse_book_list_page(url: str) -> list[dict]:
 
     for article in articles:
         title_tag = article.select_one("h3 a")
-        price_tag = article.select_one(".price_color")
-        availability_tag = article.select_one(".availability")
-        rating_tag = article.select_one("p.star-rating")
-
         relative_link = title_tag["href"]
         detail_url = urljoin(url, relative_link)
 
         title = title_tag["title"].strip()
-        price = clean_text(price_tag.get_text()) if price_tag else ""
-        availability = clean_text(availability_tag.get_text()) if availability_tag else ""
-
-        rating = 0
-        if rating_tag:
-            classes = rating_tag.get("class", [])
-            for cls in classes:
-                if cls in ["One", "Two", "Three", "Four", "Five"]:
-                    rating = rating_to_number(cls)
-                    break
 
         books.append({
             "title": title,
-            "price": price,
-            "availability": availability,
-            "rating": rating,
             "detail_url": detail_url
         })
 
@@ -83,9 +82,10 @@ def parse_book_detail(url: str) -> dict:
     soup = get_soup(url)
 
     product_main = soup.select_one(".product_main")
+
     title = ""
-    price = ""
-    availability = ""
+    price_gbp = 0.0
+    availability_count = 0
     rating = 0
 
     if product_main:
@@ -95,8 +95,12 @@ def parse_book_detail(url: str) -> dict:
         rating_tag = product_main.select_one("p.star-rating")
 
         title = clean_text(title_tag.get_text()) if title_tag else ""
-        price = clean_text(price_tag.get_text()) if price_tag else ""
-        availability = clean_text(availability_tag.get_text()) if availability_tag else ""
+
+        if price_tag:
+            price_gbp = extract_price_number(clean_text(price_tag.get_text()))
+
+        if availability_tag:
+            availability_count = extract_availability_number(clean_text(availability_tag.get_text()))
 
         if rating_tag:
             classes = rating_tag.get("class", [])
@@ -120,10 +124,10 @@ def parse_book_detail(url: str) -> dict:
     product_info = {
         "upc": "",
         "product_type": "",
-        "price_excl_tax": "",
-        "price_incl_tax": "",
-        "tax": "",
-        "num_reviews": ""
+        "price_excl_tax_gbp": 0.0,
+        "price_incl_tax_gbp": 0.0,
+        "tax_gbp": 0.0,
+        "num_reviews": 0
     }
 
     table = soup.select_one("table.table.table-striped")
@@ -143,26 +147,29 @@ def parse_book_detail(url: str) -> dict:
             elif key == "product type":
                 product_info["product_type"] = value
             elif key == "price (excl. tax)":
-                product_info["price_excl_tax"] = value
+                product_info["price_excl_tax_gbp"] = extract_price_number(value)
             elif key == "price (incl. tax)":
-                product_info["price_incl_tax"] = value
+                product_info["price_incl_tax_gbp"] = extract_price_number(value)
             elif key == "tax":
-                product_info["tax"] = value
+                product_info["tax_gbp"] = extract_price_number(value)
             elif key == "number of reviews":
-                product_info["num_reviews"] = value
+                try:
+                    product_info["num_reviews"] = int(value)
+                except ValueError:
+                    product_info["num_reviews"] = 0
 
     return {
         "title": title,
         "category": category,
-        "price": price,
-        "availability": availability,
+        "price_gbp": price_gbp,
+        "availability_count": availability_count,
         "rating": rating,
         "description": description,
         "upc": product_info["upc"],
         "product_type": product_info["product_type"],
-        "price_excl_tax": product_info["price_excl_tax"],
-        "price_incl_tax": product_info["price_incl_tax"],
-        "tax": product_info["tax"],
+        "price_excl_tax_gbp": product_info["price_excl_tax_gbp"],
+        "price_incl_tax_gbp": product_info["price_incl_tax_gbp"],
+        "tax_gbp": product_info["tax_gbp"],
         "num_reviews": product_info["num_reviews"],
         "detail_url": url
     }
@@ -179,9 +186,10 @@ def get_all_catalogue_pages() -> list[str]:
             response = requests.get(page_url, headers=HEADERS, timeout=30)
             if response.status_code != 200:
                 break
+
             page_urls.append(page_url)
-            print(f"Found catalogue page: {page_url}")
             page_number += 1
+
         except requests.RequestException:
             break
 
@@ -192,15 +200,12 @@ def scrape_all_books() -> pd.DataFrame:
     all_rows = []
 
     page_urls = get_all_catalogue_pages()
-    print(f"\nTotal catalogue pages found: {len(page_urls)}\n")
 
     for page_index, page_url in enumerate(page_urls, start=1):
-        print(f"Scraping list page {page_index}/{len(page_urls)}: {page_url}")
         books_on_page = parse_book_list_page(page_url)
 
         for book_index, book in enumerate(books_on_page, start=1):
             try:
-                print(f"  Scraping detail {book_index}/{len(books_on_page)}: {book['title']}")
                 detail_data = parse_book_detail(book["detail_url"])
                 all_rows.append(detail_data)
                 time.sleep(0.2)
@@ -213,9 +218,7 @@ def scrape_all_books() -> pd.DataFrame:
 
 def main():
     df = scrape_all_books()
-    df.to_csv("books_to_scrape.csv", index=False, encoding="utf-8")
-    print("\nSaved file: books_to_scrape.csv")
-    print(f"Total books scraped: {len(df)}")
+    df.to_csv("books.csv", index=False, encoding="utf-8")
 
 
 if __name__ == "__main__":
